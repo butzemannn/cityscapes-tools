@@ -4,6 +4,18 @@
 import argparse
 import os
 import json
+import quaternion
+import sympy
+import csv
+from alive_progress import alive_bar
+
+from lib.cityscapesScripts.cityscapesscripts.helpers.annotation import CsBbox3d
+from lib.cityscapesScripts.cityscapesscripts.helpers.box3dImageTransform import (
+    Camera,
+    Box3dImageTransform,
+    CRS_S,
+    CRS_V,
+)
 
 """
 Kitti gt format:
@@ -29,7 +41,7 @@ Kitti gt format:
 """
 
 
-def setup_arguments() -> argparse.Namespace:
+def _setup_arguments() -> argparse.Namespace:
     """
     Setup arguments
     :return:
@@ -42,11 +54,48 @@ def setup_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def generate_calib(source_data: dict):
-    pass
+def _setup_image_transform(source_data: dict) -> Box3dImageTransform:
+    """
+    Setup the image transformation according to
+    https://github.com/mcordts/cityscapesScripts/blob/master/docs/Box3DImageTransform.ipynb
+    """
+    camera = Camera(fx=source_data['sensor']['fx'],
+                    fy=source_data['sensor']['fy'],
+                    u0=source_data['sensor']['u0'],
+                    v0=source_data['sensor']['v0'],
+                    sensor_T_ISO_8855=source_data['sensor']['sensor_T_ISO_8855'])
+
+    box3d_annotation = Box3dImageTransform(camera=camera)
+
+    return box3d_annotation
 
 
-def _convert_occulsion(occlusion: float) -> int:
+def _transform_box(box_data: dict, box3d_annotation: Box3dImageTransform) -> tuple:
+    """
+    Has to be transformed to coordinate system CRS_S
+    :param box_data: A single objects bounding box
+    :return:
+    """
+
+    obj = CsBbox3d()
+    obj.fromJsonText(box_data)
+    box3d_annotation.initialize_box_from_annotation(obj, coordinate_system=CRS_V)
+    size_v, center_v, rotation_v = box3d_annotation.get_parameters(coordinate_system=CRS_S)
+
+    # change to different quaternion library to convert to euler angles
+    rotation_v = quaternion.from_float_array(rotation_v.elements)
+    rotation_v_euler = quaternion.as_euler_angles(rotation_v)
+
+    return size_v, center_v, rotation_v_euler
+
+
+def _calculate_alpha(center: list) -> float:
+    """Returns the observation angle alpha of the bounding box center"""
+    x, y, z = center
+    return float(sympy.simplify(sympy.acot(x/y)))
+
+
+def _convert_occlusion(occlusion: float) -> int:
     """
      Converts cityscapes occlusion (float between 0.0 and 1.0) into Kitti format (0, 1, 2 or 3).
      :param occlusion:  Cityscapes occlusion value
@@ -66,34 +115,68 @@ def _convert_occulsion(occlusion: float) -> int:
         return 3
 
 
-def generate_objects(source_data: dict):
+def generate_objects(source_data: dict) -> list:
+    """
+    Generates a list of objects in kitti format, which can be then saved to a file
+    :param source_data: Data in json format comming from cityscapes dataset
+    :return: A list containing all objects in kitti format
+    """
     resulting_objects = []
     objects = source_data['objects']
-    for object in objects:
-        if not object['label'] == 'car':
+    box3d_annotation = _setup_image_transform(source_data)
+    for item in objects:
+        if 'car' not in str.lower(item['label']):
             # currently only cars tested
             continue
+
+        size, center, angle = _transform_box(item, box3d_annotation)
+        coords_2d = item['2d']['amodal']
         kitti_gt = [
             'Car',
-            object['truncation'],
-            _convert_occulsion(object['occlusion']),
-            
-
+            item['truncation'],
+            _convert_occlusion(item['occlusion']),
+            _calculate_alpha(center),
+            coords_2d[0], coords_2d[1], coords_2d[2], coords_2d[3],
+            size[0], size[1], size[2],
+            center[0], center[1], center[2],
+            angle[1],
         ]
 
         resulting_objects.append(kitti_gt)
+
+    return resulting_objects
+
+
+def save_as_kitti_gt(file_name, objects: list) -> None:
+    """
+    Save to file with kitti gt format
+    :param file_name: The file name. Will be created if not existing.
+    :param objects: A list of objects [[obj1..][obj2..]..]
+    :return: None
+    """
+    with open(file_name, 'w+') as f:
+        writer = csv.writer(f, delimiter=' ')
+        writer.writerows(objects)
+
+
+def generate_calib(source_data: dict):
+    # TODO
+    pass
 
 
 def main(source_folder: str, dest_folder: str):
     # TODO: check if file is json
     source_files = os.listdir(source_folder)
-    for source_file in source_files:
-        with open(f"{source_folder}/{source_file}") as f:
-            source_data = json.load(f)
-            # generate_calib(source_data)
-            generate_objects(source_data)
+    with alive_bar(len(source_files)) as bar:
+        for source_file in source_files:
+            with open(f"{source_folder}/{source_file}") as f:
+                source_data = json.load(f)
+                # generate_calib(source_data)
+                objects = generate_objects(source_data)
+                save_as_kitti_gt(f"{dest_folder}/{source_file[:-5]}.txt", objects)
+                bar()
 
 
 if __name__ == "__main__":
-    args = setup_arguments()
+    args = _setup_arguments()
     main(args.source_folder, args.dest_folder)

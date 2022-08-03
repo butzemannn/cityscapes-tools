@@ -9,3 +9,4 @@ class TestConvert2Kitti(TestCase):
 
     def test_generate_objects(self):
         generate_objects(test_data)
+        #self.fail()
