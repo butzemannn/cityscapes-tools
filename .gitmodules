@@ -1,0 +1,3 @@
+[submodule "lib/cityscapesScripts"]
+	path = lib/cityscapesScripts
+	url = https://github.com/mcordts/cityscapesScripts.git
