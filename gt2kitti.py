@@ -1,4 +1,4 @@
-#!/bin/env python3
+#!/usr/env python3
 # Converts Cityscapes ground truth boxes to kitti format
 
 import argparse
@@ -7,7 +7,10 @@ import json
 import quaternion
 import sympy
 import csv
+import math
+import numpy as np
 from alive_progress import alive_bar
+from scipy.spatial.transform import Rotation
 
 from lib.cityscapesScripts.cityscapesscripts.helpers.annotation import CsBbox3d
 from lib.cityscapesScripts.cityscapesscripts.helpers.box3dImageTransform import (
@@ -16,6 +19,7 @@ from lib.cityscapesScripts.cityscapesscripts.helpers.box3dImageTransform import 
     CRS_S,
     CRS_V,
 )
+from utils.csstructure import list_subdirs, create_parent_dirs
 
 """
 Kitti gt format:
@@ -43,8 +47,13 @@ Kitti gt format:
 
 def _setup_arguments() -> argparse.Namespace:
     """
-    Setup arguments
-    :return:
+    Setup arguments for command line interface usage. These include
+        source_folder: Folder which contains the cityscapes ground truth files, which should be converted to kitti format.
+        dest_folder: The destination folder, where the newly created ground truth files should be saved.
+
+    The resulting folder structure will be the same as the cityscapes structure. For a conversion please refer to the structure2kitti.py file.
+
+    :return: The parsed arguments from argument parser object.
     """
     parser = argparse.ArgumentParser(description="Converts Cityscapes ground truth boxes to kitti format.")
     parser.add_argument('source_folder', type=str, help='Source folder containing cityscapes ground truth files.')
@@ -72,9 +81,12 @@ def _setup_image_transform(source_data: dict) -> Box3dImageTransform:
 
 def _transform_box(box_data: dict, box3d_annotation: Box3dImageTransform) -> tuple:
     """
-    Has to be transformed to coordinate system CRS_S
-    :param box_data: A single objects bounding box
-    :return:
+    Transform box with cityscapes toolbox. Has to be transformed to coordinate system CRS_S. Furthermore, the angle 
+    has to be converted from quarternion to euler representation. Therefore all three angles have to be regarded, 
+    which then avoids problems with flipped boxes.
+
+    :param box_data: A single object's bounding box
+    :return:[size_v, center_v, rotation_v] in CRS_S coordinate system.
     """
 
     obj = CsBbox3d()
@@ -82,25 +94,37 @@ def _transform_box(box_data: dict, box3d_annotation: Box3dImageTransform) -> tup
     box3d_annotation.initialize_box_from_annotation(obj, coordinate_system=CRS_V)
     size_v, center_v, rotation_v = box3d_annotation.get_parameters(coordinate_system=CRS_S)
 
-    # change to different quaternion library to convert to euler angles
-    rotation_v = quaternion.from_float_array(rotation_v.elements)
-    rotation_v_euler = quaternion.as_euler_angles(rotation_v)
+    # angle generation
+    r = Rotation.from_quat(rotation_v.elements)
+    vector = np.array([0, 0, 1])
+    vector = r.apply(vector)
+    # project onto plane
+    vector[1] = 0
+    angle = math.acos(vector[2] / np.linalg.norm(vector))
+    if vector[0] > 0:
+        # If x component of vector is positive, the angle has to be negated
+        angle = -angle
 
-    return size_v, center_v, rotation_v_euler
+    rotation_v_euler = r.as_euler("xyz", degrees=False)
+
+    return size_v, center_v, angle
 
 
-def _calculate_alpha(center: list) -> float:
+def _calculate_alpha(center: list, angle: float) -> float:
     """Returns the observation angle alpha of the bounding box center"""
     x, y, z = center
-    return float(sympy.simplify(sympy.acot(x/y)))
+
+    return angle + float(sympy.simplify(sympy.atan(x/z)))
 
 
 def _convert_occlusion(occlusion: float) -> int:
     """
      Converts cityscapes occlusion (float between 0.0 and 1.0) into Kitti format (0, 1, 2 or 3).
+
      :param occlusion:  Cityscapes occlusion value
      :return: Kitti occlusion format (0, 1, 2, or 3)
      """
+
     if occlusion == 0.0:
         # fully visible
         return 0
@@ -135,13 +159,12 @@ def generate_objects(source_data: dict) -> list:
             'Car',
             item['truncation'],
             _convert_occlusion(item['occlusion']),
-            _calculate_alpha(center),
+            _calculate_alpha(center, angle),
             coords_2d[0], coords_2d[1], coords_2d[2], coords_2d[3],
-            size[0], size[1], size[2],
-            center[0], center[1], center[2],
-            angle[1],
+            size[2], size[0], size[1],
+            center[0], center[1]+0.5*size[2], center[2],
+            angle,
         ]
-
         resulting_objects.append(kitti_gt)
 
     return resulting_objects
@@ -150,27 +173,34 @@ def generate_objects(source_data: dict) -> list:
 def save_as_kitti_gt(file_name, objects: list) -> None:
     """
     Save to file with kitti gt format
+
     :param file_name: The file name. Will be created if not existing.
     :param objects: A list of objects [[obj1..][obj2..]..]
     :return: None
     """
+    create_parent_dirs(file_name)
     with open(file_name, 'w+') as f:
         writer = csv.writer(f, delimiter=' ')
         writer.writerows(objects)
 
 
-def generate_calib(source_data: dict):
-    # TODO
-    pass
-
-
 def main(source_folder: str, dest_folder: str):
-    # TODO: check if file is json
-    source_files = os.listdir(source_folder)
+    """
+    Execute the main function. Iterate over source folder and load json data. Execute the corresponding program functions.
+
+    :param source_folder: String containing the source folder location
+    :param dest_folder: String containing the destination folder, where resulting gt boxes will be stored
+    """
+
+    source_files = list_subdirs(source_folder)
     with alive_bar(len(source_files)) as bar:
         for source_file in source_files:
             with open(f"{source_folder}/{source_file}") as f:
-                source_data = json.load(f)
+                try:
+                    source_data = json.load(f)
+                except ValueError:
+                    print("Error while loading json file.")
+
                 # generate_calib(source_data)
                 objects = generate_objects(source_data)
                 save_as_kitti_gt(f"{dest_folder}/{source_file[:-5]}.txt", objects)
